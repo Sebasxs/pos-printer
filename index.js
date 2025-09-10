@@ -1,6 +1,9 @@
 const path = require('path');
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 
+const winston = require('winston');
+const { LoggingWinston } = require('@google-cloud/logging-winston');
+
 const { createClient } = require('@supabase/supabase-js');
 const usb = require('usb');
 const escpos = require('escpos');
@@ -25,6 +28,21 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY
          eventsPerSecond: 10,
       },
    },
+});
+
+const loggingWinston = new LoggingWinston({
+   projectId: process.env.GOOGLE_PROJECT_ID,
+   keyFilename: path.join(__dirname, 'gcp-key.json'),
+});
+
+const logger = winston.createLogger({
+   level: 'info',
+   transports: [
+      new winston.transports.Console({
+         format: winston.format.combine(winston.format.colorize(), winston.format.simple()),
+      }),
+      loggingWinston,
+   ],
 });
 
 const drawRow = (leftStr, rightStr, fillChar = ' ', maxCols = WIDTH_NORMAL) => {
@@ -59,7 +77,7 @@ const updateJobStatus = async (id, status) => {
       const payload = { status: status };
       await supabase.from('print_jobs').update(payload).eq('id', id);
    } catch (e) {
-      console.error(`Error updating job status (ID ${id}):`, e);
+      logger.error('Failed to update job status', { jobId: id, error: e.message, stack: e.stack });
    }
 };
 
@@ -76,7 +94,7 @@ const performPrint = (jobId, data) => {
          return reject(err);
       }
 
-      console.log(`🖨️  Job ID: ${jobId}`);
+      logger.info('Print job started', { jobId });
 
       const items = Array.isArray(data.items) ? data.items : [];
 
@@ -205,7 +223,7 @@ const performPrint = (jobId, data) => {
             printer.feed(3);
             printer.cut();
 
-            console.log('✅ Job completed.');
+            logger.info('Print job completed', { jobId });
             setTimeout(() => {
                try {
                   printer.close();
@@ -215,7 +233,11 @@ const performPrint = (jobId, data) => {
                }
             }, 300);
          } catch (printErr) {
-            console.error('🔥 Job error:', printErr);
+            logger.error('Print job failed', {
+               jobId,
+               error: printErr.message,
+               stack: printErr.stack,
+            });
             try {
                printer.close();
             } catch (e) {}
@@ -237,7 +259,7 @@ const printTicketSafe = async (jobId, data) => {
       await Promise.race([performPrint(jobId, data), timeoutPromise]);
       await updateJobStatus(jobId, 'printed');
    } catch (error) {
-      console.error(`Error processing Job ${jobId}:`, error);
+      logger.error('Job processing failed', { jobId, error: error.message, stack: error.stack });
       await updateJobStatus(jobId, 'error');
    }
 };
@@ -255,7 +277,7 @@ const processQueue = async () => {
       await printTicketSafe(job.id, job.payload);
       await new Promise(r => setTimeout(r, 2000));
    } catch (e) {
-      console.error('Error processing queue:', e);
+      logger.error('Queue processing failed', { error: e.message, stack: e.stack });
    } finally {
       isPrinting = false;
       processQueue();
@@ -263,23 +285,23 @@ const processQueue = async () => {
 };
 
 const addToQueue = (id, payload) => {
-   console.log(`📥 Adding to queue: ID ${id}`);
+   logger.info('Job added to queue', { jobId: id });
    queue.push({ id, payload });
    processQueue();
 };
 
-console.log('🚀 Printer Agent Starting...');
+logger.info('Printer agent starting');
 
 const processPending = async () => {
    try {
       const { data, error } = await supabase.from('print_jobs').select('*').eq('status', 'pending');
       if (error) throw error;
       if (data && data.length > 0) {
-         console.log(`📦 Enqueueing ${data.length} pending...`);
+         logger.info('Enqueueing pending jobs', { count: data.length });
          data.forEach(job => addToQueue(job.id, job.payload));
       }
    } catch (e) {
-      console.error('Error searching for pending:', e);
+      logger.error('Failed to fetch pending jobs', { error: e.message, stack: e.stack });
    }
 };
 
@@ -288,7 +310,7 @@ processPending();
 let myChannel = null;
 
 const setupListener = () => {
-   console.log('📡 (Re)Starting Supabase listener...');
+   logger.info('Starting Supabase realtime listener');
 
    if (myChannel) {
       supabase.removeChannel(myChannel);
@@ -306,15 +328,15 @@ const setupListener = () => {
          },
       )
       .subscribe(status => {
-         console.log(`Socket status: ${status}`);
+         logger.info('Realtime socket status changed', { status });
 
          if (status === 'SUBSCRIBED') {
-            console.log('✅ Connected to Realtime. Listening...');
+            logger.info('Connected to Realtime successfully');
             processPending();
          }
 
          if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT' || status === 'CLOSED') {
-            console.error(`⚠️ Error in connection (${status}). Restarting in 10s...`);
+            logger.error('Realtime connection error, restarting', { status, retryDelay: '10s' });
 
             setTimeout(() => {
                setupListener();
@@ -326,10 +348,10 @@ const setupListener = () => {
 setupListener();
 
 process.on('uncaughtException', err => {
-   console.error('UNCAUGHT EXCEPTION:', err);
+   logger.error('Uncaught exception', { error: err.message, stack: err.stack });
 });
 process.on('unhandledRejection', reason => {
-   console.error('UNHANDLED REJECTION:', reason);
+   logger.error('Unhandled rejection', { reason: reason?.message || reason, stack: reason?.stack });
 });
 
 setInterval(processPending, 5 * 60 * 1000);
