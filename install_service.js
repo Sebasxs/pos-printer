@@ -5,7 +5,7 @@ const svc = new Service({
    name: 'SmartPOS Printer Agent',
    description: 'Automatic printing service for Smart POS Web.',
    script: path.join(__dirname, 'index.js'),
-   nodeOptions: ['--harmony', '--max_old_space_size=4096'],
+   nodeOptions: ['--harmony'],
    workingDirectory: __dirname,
 });
 
